@@ -175,7 +175,7 @@ function BrowserPreviewScreen({
             environmentId={environmentId}
             tab={tab}
             streaming={streaming}
-            ready={streaming && canControl}
+            ready={canControl && (streaming || tab.navStatus._tag === "LoadFailed")}
             onCommand={(input) => streamRef.current?.command(input)}
             onPaste={() => streamRef.current?.paste()}
           />
@@ -186,6 +186,9 @@ function BrowserPreviewScreen({
               threadId={threadId}
               tabId={tab.tabId}
               pdfUri={pdfUri}
+              pageFailure={
+                tab.navStatus._tag === "LoadFailed" ? tab.navStatus.description : undefined
+              }
               ref={streamRef}
               interactive
               background={themeVariables["--color-sheet-solid"]}

@@ -11,6 +11,7 @@ import {
   type PreviewAutomationStatus,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -35,6 +36,7 @@ import * as PreviewBrowser from "./PreviewBrowser.ts";
 vi.mock("./ServerBrowserContexts.ts", () => ({
   presentAsChrome: async () => {},
   ServerBrowserContexts: class {
+    private readonly cached = new Map<string, ReturnType<typeof makeContext>>();
     private readonly onClose: ((context: BrowserContext) => void) | undefined;
     constructor(options: { onContextClose?: (context: BrowserContext) => void }) {
       this.onClose = options.onContextClose;
@@ -42,13 +44,23 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
     async contextFor(profileId: string, isolationKey?: string) {
       contextRequests.push({ profileId, isolated: isolationKey !== undefined });
       if (contextFailure) throw contextFailure;
+      contextEntered?.resolve();
       await contextGate?.promise;
-      const context = makeContext(this.onClose);
+      const key = JSON.stringify([profileId, isolationKey]);
+      const existing = this.cached.get(key);
+      if (existing) return existing as unknown as BrowserContext;
+      const context = makeContext((closed) => {
+        this.cached.delete(key);
+        this.onClose?.(closed);
+      });
+      this.cached.set(key, context);
       contexts.push(context);
       return context as unknown as BrowserContext;
     }
     async scratchPage() {
-      return makeContext().page as unknown as Page;
+      const context = makeContext();
+      scratchContexts.push(context);
+      return context.page as unknown as Page;
     }
     async connectDesktopPage(endpoint: string) {
       const context = makeContext();
@@ -108,81 +120,98 @@ function makeSession(frame?: ReturnType<typeof makeFrame>) {
 }
 
 function makeContext(onClose?: (context: BrowserContext) => void) {
-  const events = new NodeEvents.EventEmitter();
-  const nativeFileChooser = vi.fn();
-  const setChooserFiles = vi.fn(async (_files: unknown) => {});
   const sessions: ReturnType<typeof makeSession>[] = [];
-  let url = "about:blank";
-  let viewport = { width: 1280, height: 800 };
-  let closed = false;
   let contextClosed = false;
-  const page = {
-    on: (name: string, callback: (...args: unknown[]) => void) => events.on(name, callback),
-    once: (name: string, callback: (...args: unknown[]) => void) => events.once(name, callback),
-    off: (name: string, callback: (...args: unknown[]) => void) => events.off(name, callback),
-    emit: (name: string, ...args: unknown[]) => events.emit(name, ...args),
-    nativeFileChooser,
-    setChooserFiles,
-    openFileChooser: () => {
-      if (
-        !events.emit("filechooser", {
-          isMultiple: () => false,
-          element: () => ({ getAttribute: async () => ".csv" }),
-          setFiles: setChooserFiles,
-        })
-      ) {
-        nativeFileChooser();
-      }
-    },
-    emitAsync: (name: string, ...args: unknown[]) =>
-      Promise.all(events.listeners(name).map((listener) => listener(...args))),
-    setDefaultTimeout: vi.fn(),
-    setDefaultNavigationTimeout: vi.fn(),
-    context: () => context,
-    mainFrame: () => page,
-    frames: () => [page],
-    url: () => url,
-    title: vi.fn(async () => "test page"),
-    viewportSize: () => viewport,
-    setViewportSize: vi.fn(async (size: typeof viewport) => {
-      viewport = size;
-    }),
-    goto: vi.fn(async (next: string) => {
-      url = next;
-      events.emit("load");
-    }),
-    goBack: vi.fn(async () => {}),
-    goForward: vi.fn(async () => {}),
-    reload: vi.fn(async () => {}),
-    emulateMedia: vi.fn(async () => {}),
-    waitForLoadState: vi.fn(async () => {}),
-    evaluate: vi.fn(async () => ({
-      url,
-      title: "test page",
-      loading: false,
-      visibleText: "delete",
-      interactiveElements: [],
-    })),
-    ariaSnapshot: vi.fn(async () => '- button "delete" [ref=e1]'),
-    locator: vi.fn(() => {
-      throw new Error("Unexpected locator action");
-    }),
-    isClosed: () => closed,
-    close: vi.fn(async () => {
-      if (!closed) {
-        closed = true;
-        events.emit("close");
-      }
-    }),
+  const makePage = () => {
+    const events = new NodeEvents.EventEmitter();
+    const nativeFileChooser = vi.fn();
+    const setChooserFiles = vi.fn(async (_files: unknown) => {});
+    let url = "about:blank";
+    let viewport = { width: 1280, height: 800 };
+    let closed = false;
+    const page = {
+      on: (name: string, callback: (...args: unknown[]) => void) => events.on(name, callback),
+      once: (name: string, callback: (...args: unknown[]) => void) => events.once(name, callback),
+      off: (name: string, callback: (...args: unknown[]) => void) => events.off(name, callback),
+      emit: (name: string, ...args: unknown[]) => events.emit(name, ...args),
+      nativeFileChooser,
+      setChooserFiles,
+      openFileChooser: () => {
+        if (
+          !events.emit("filechooser", {
+            isMultiple: () => false,
+            element: () => ({ getAttribute: async () => ".csv" }),
+            setFiles: setChooserFiles,
+          })
+        ) {
+          nativeFileChooser();
+        }
+      },
+      emitAsync: (name: string, ...args: unknown[]) =>
+        Promise.all(events.listeners(name).map((listener) => listener(...args))),
+      setDefaultTimeout: vi.fn(),
+      setDefaultNavigationTimeout: vi.fn(),
+      context: () => context,
+      mainFrame: () => page,
+      frames: () => [page],
+      url: () => url,
+      title: vi.fn(async () => "test page"),
+      viewportSize: () => viewport,
+      setViewportSize: vi.fn(async (size: typeof viewport) => {
+        viewport = size;
+      }),
+      goto: vi.fn(async (next: string) => {
+        url = next;
+        events.emit("load");
+      }),
+      goBack: vi.fn(async () => {}),
+      goForward: vi.fn(async () => {}),
+      reload: vi.fn(async () => {}),
+      emulateMedia: vi.fn(async () => {}),
+      waitForLoadState: vi.fn(async () => {}),
+      evaluate: vi.fn(async () => ({
+        url,
+        title: "test page",
+        loading: false,
+        visibleText: "delete",
+        interactiveElements: [],
+      })),
+      ariaSnapshot: vi.fn(async () => '- button "delete" [ref=e1]'),
+      locator: vi.fn(() => {
+        throw new Error("Unexpected locator action");
+      }),
+      isClosed: () => closed,
+      close: vi.fn(async () => {
+        if (!closed) {
+          closed = true;
+          events.emit("close");
+        }
+      }),
+    };
+    return page;
   };
+  const page = makePage();
+  const pages = [page];
+  let firstPage = true;
   const context = {
     page,
+    pages,
     sessions,
-    newPage: async () => page as unknown as Page,
+    newPage: async () => {
+      if (firstPage) {
+        firstPage = false;
+        return page as unknown as Page;
+      }
+      const next = makePage();
+      pages.push(next);
+      return next as unknown as Page;
+    },
     grantPermissions: vi.fn(async () => {}),
     newCDPSession: async (target: unknown) => {
       const session = makeSession(
-        target === page ? undefined : (target as ReturnType<typeof makeFrame>),
+        pages.includes(target as typeof page)
+          ? undefined
+          : (target as ReturnType<typeof makeFrame>),
       );
       sessions.push(session);
       return session;
@@ -190,7 +219,7 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
     close: vi.fn(async () => {
       if (contextClosed) return;
       contextClosed = true;
-      await page.close();
+      for (const current of pages) await current.close();
       onClose?.(context as unknown as BrowserContext);
     }),
   };
@@ -200,6 +229,8 @@ function makeContext(onClose?: (context: BrowserContext) => void) {
 const contexts: ReturnType<typeof makeContext>[] = [];
 const contextRequests: Array<{ profileId: string; isolated: boolean }> = [];
 let contextGate: PromiseWithResolvers<void> | null = null;
+let contextEntered: PromiseWithResolvers<void> | null = null;
+const scratchContexts: ReturnType<typeof makeContext>[] = [];
 let pageCopy = "";
 let keyCopy = "";
 let focusedFrame: ReturnType<typeof makeFrame> | null = null;
@@ -313,6 +344,8 @@ beforeEach(() => {
   contexts.length = 0;
   contextRequests.length = 0;
   contextGate = null;
+  contextEntered = null;
+  scratchContexts.length = 0;
   contextFailure = null;
   pageCopy = "";
   keyCopy = "";
@@ -322,6 +355,636 @@ beforeEach(() => {
   releasedDesktopTabs.length = 0;
   desktopConnections.length = 0;
 });
+
+it.live("shared context teardown closes both a crashed tab and its healthy sibling", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      const opened = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { profileId: "default", reuseExistingTab: false, show: false },
+      });
+      const sibling = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        operation: "open",
+        input: { profileId: "default", reuseExistingTab: false, show: false },
+      });
+      const events = yield* manager.subscribeEvents;
+      contexts[0]!.page.emit("crash");
+      let event = yield* PubSub.take(events);
+      while (event.type !== "failed") event = yield* PubSub.take(events);
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(2);
+      yield* Effect.promise(() => contexts[0]!.close());
+      // The healthy sibling's close confirms the context callback has run too.
+      event = yield* PubSub.take(events);
+      while (event.type !== "closed" || event.tabId !== sibling.tabId)
+        event = yield* PubSub.take(events);
+      expect(
+        (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map((s) => s.tabId),
+      ).not.toContain(opened.tabId);
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(0);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "status reports a crashed page execution error and navigation recovers the same identity",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const events = yield* manager.subscribeEvents;
+        contexts[0]!.page.emit("crash");
+        yield* PubSub.take(events);
+        const result = yield* broker
+          .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+          .pipe(Effect.exit);
+        expect(result._tag).toBe("Failure");
+        const failure = yield* broker
+          .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+          .pipe(Effect.flip);
+        expect(failure).toMatchObject({
+          _tag: "PreviewAutomationExecutionError",
+          message: expect.stringMatching(/crash.*Reload/i),
+        });
+        expect(
+          (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map((s) => s.tabId),
+        ).toEqual([tabId]);
+        const recovered = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          tabId,
+          operation: "navigate",
+          input: { url: "https://example.com/recovered" },
+        });
+        expect(recovered).toMatchObject({
+          available: true,
+          tabId,
+          url: "https://example.com/recovered",
+        });
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("delayed callbacks from a crashed page cannot publish phantom state or tabs", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const events = yield* manager.subscribeEvents;
+      const old = contexts[0]!.page;
+      old.emit("crash");
+      yield* PubSub.take(events);
+      const dismiss = vi.fn(async () => {});
+      yield* Effect.promise(() =>
+        old.emitAsync("dialog", {
+          type: () => "alert",
+          message: () => "stale",
+          defaultValue: () => "",
+          dismiss,
+        }),
+      );
+      const controls = (yield* Queue.clear(viewer.output)).filter(
+        (item) => item._tag === "control",
+      );
+      expect(controls.every((item) => item.dialog === null)).toBe(true);
+      expect(dismiss).toHaveBeenCalledOnce();
+      const popup = makeContext().page;
+      yield* Effect.promise(() => old.emitAsync("popup", popup));
+      expect(popup.isClosed()).toBe(true);
+      expect(
+        (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map((s) => s.tabId),
+      ).toEqual([tabId]);
+      const downloadFailure = vi.fn(async () => null);
+      yield* Effect.promise(() => old.emitAsync("download", { failure: downloadFailure }));
+      expect(downloadFailure).not.toHaveBeenCalled();
+      const responseUrl = vi.fn(() => "https://example.com/stale");
+      old.emit("response", {
+        url: responseUrl,
+        request: () => ({ method: () => "GET" }),
+        status: () => 200,
+      });
+      const consoleText = vi.fn(() => "stale");
+      old.emit("console", { type: () => "log", text: consoleText });
+      expect(responseUrl).not.toHaveBeenCalled();
+      expect(consoleText).not.toHaveBeenCalled();
+      yield* broker.invoke({
+        scope,
+        tabId,
+        operation: "navigate",
+        input: { url: "https://example.com/new" },
+      });
+      yield* Effect.promise(() => old.emitAsync("dialog", { dismiss }));
+      expect(dismiss).toHaveBeenCalledTimes(2);
+      const status = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId,
+        operation: "status",
+        input: {},
+      });
+      expect(status.dialog).toBeNull();
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a download already saving when its page crashes is removed without a phantom row", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const events = yield* manager.subscribeEvents;
+      const old = contexts[0]!.page;
+      const saved = yield* Queue.unbounded<string>();
+      const written = Promise.withResolvers<void>();
+      const pending = old.emitAsync("download", {
+        failure: async () => null,
+        saveAs: (path: string) => {
+          Queue.offerUnsafe(saved, path);
+          return written.promise;
+        },
+        suggestedFilename: () => "stale.csv",
+        url: () => "blob:https://example.com/1",
+      });
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Queue.take(saved);
+      yield* fs.writeFileString(path, "a,b");
+      old.emit("crash");
+      yield* PubSub.take(events);
+      yield* Queue.clear(viewer.output);
+      written.resolve();
+      yield* Effect.promise(() => pending);
+      expect(yield* fs.exists(path)).toBe(false);
+      expect((yield* Queue.clear(viewer.output)).some((item) => item._tag === "download")).toBe(
+        false,
+      );
+      yield* broker.invoke({
+        scope,
+        tabId,
+        operation: "navigate",
+        input: { url: "https://example.com/new" },
+      });
+      const status = yield* broker.invoke<PreviewAutomationStatus>({
+        scope,
+        tabId,
+        operation: "status",
+        input: {},
+      });
+      expect(status.downloads).toEqual([]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live(
+  "queued viewer recoveries and an agent input cannot outlive a close during gated recovery",
+  () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { browser, broker, tabId } = yield* ready;
+        const manager = yield* Manager.PreviewManager;
+        const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        const events = yield* manager.subscribeEvents;
+        contexts[0]!.page.emit("crash");
+        yield* PubSub.take(events);
+        yield* viewer.input({ type: "takeControl" });
+        yield* Queue.clear(viewer.output);
+        const gate = Promise.withResolvers<void>();
+        contextGate = gate;
+        contextEntered = Promise.withResolvers<void>();
+        yield* Effect.addFinalizer(() => Effect.sync(() => gate.resolve()));
+        const first = yield* viewer.input({ type: "reload" }).pipe(Effect.forkScoped);
+        yield* Effect.promise(() => contextEntered!.promise);
+        const queued = yield* Deferred.make<void>();
+        const second = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(queued, undefined);
+          yield* viewer.input({ type: "navigate", url: "https://example.com/stale" });
+        }).pipe(Effect.forkScoped);
+        yield* Deferred.await(queued);
+        const agent = yield* broker
+          .invoke<void>({
+            scope,
+            tabId,
+            operation: "navigate",
+            input: { url: "https://example.com/agent" },
+          })
+          .pipe(Effect.flip);
+        expect(agent).toMatchObject({
+          _tag: "PreviewAutomationControlInterruptedError",
+          reason: "humanControl",
+        });
+        yield* manager.close({ threadId: scope.thread.threadId, tabId });
+        let gone = yield* Queue.take(viewer.output);
+        while (gone._tag !== "gone") gone = yield* Queue.take(viewer.output);
+        gate.resolve();
+        yield* Fiber.join(first);
+        yield* Fiber.join(second);
+        expect(contexts).toHaveLength(2);
+        expect(contexts[1]!.page.isClosed()).toBe(true);
+        expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toEqual([]);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("a recovering tab counts once against the server tab limit", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const broker = yield* Broker.PreviewAutomationBroker;
+      const manager = yield* Manager.PreviewManager;
+      yield* Effect.yieldNow;
+      const ids: string[] = [];
+      for (let i = 0; i < 31; i++) {
+        const opened = yield* broker.invoke<PreviewAutomationStatus>({
+          scope: asSession(`owner-${Math.floor(i / 8)}`),
+          operation: "open",
+          input: { profileId: "default", reuseExistingTab: false, show: false },
+        });
+        ids.push(opened.tabId!);
+      }
+      const events = yield* manager.subscribeEvents;
+      contexts[0]!.page.emit("crash");
+      yield* PubSub.take(events);
+      const gate = Promise.withResolvers<void>();
+      contextGate = gate;
+      contextEntered = Promise.withResolvers<void>();
+      yield* Effect.addFinalizer(() => Effect.sync(() => gate.resolve()));
+      const recovering = yield* broker
+        .invoke({
+          scope: asSession("owner-0"),
+          tabId: ids[0]!,
+          operation: "navigate",
+          input: { url: "https://example.com/recovered" },
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Effect.promise(() => contextEntered!.promise);
+      // Only the already-entered recovery stays gated; a distinct open can finish.
+      contextGate = null;
+      const opened = yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope: asSession("owner-4"),
+          operation: "open",
+          input: { profileId: "default", reuseExistingTab: false, show: false },
+        })
+        .pipe(Effect.exit);
+      gate.resolve();
+      expect((yield* Fiber.join(recovering))._tag).toBe("Success");
+      expect(opened._tag).toBe("Success");
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(32);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a file chooser awaiting metadata cannot reopen after its page crashes", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      yield* viewer.input({ type: "takeControl" });
+      const events = yield* manager.subscribeEvents;
+      const metadata = Promise.withResolvers<string>();
+      const entered = Promise.withResolvers<void>();
+      const old = contexts[0]!.page;
+      const pending = old.emitAsync("filechooser", {
+        element: () => ({
+          getAttribute: () => {
+            entered.resolve();
+            return metadata.promise;
+          },
+        }),
+        isMultiple: () => false,
+      });
+      yield* Effect.promise(() => entered.promise);
+      old.emit("crash");
+      yield* PubSub.take(events);
+      yield* Queue.clear(viewer.output);
+      metadata.resolve(".csv");
+      yield* Effect.promise(() => pending);
+      expect((yield* Queue.clear(viewer.output)).some((item) => item._tag === "fileChooser")).toBe(
+        false,
+      );
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a renderer crash retains the logical tab with an authoritative failure", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const before = (yield* manager.list({ threadId: scope.thread.threadId })).sessions;
+      const events = yield* manager.subscribeEvents;
+
+      contexts[0]!.page.emit("crash");
+      const event = yield* PubSub.take(events);
+      expect(event.type).toBe("failed");
+      const agent = yield* broker
+        .invoke<PreviewAutomationSnapshot>({ scope, tabId, operation: "snapshot", input: {} })
+        .pipe(Effect.flip);
+      expect(agent).toMatchObject({ _tag: "PreviewAutomationExecutionError" });
+      expect(agent.message).toMatch(/crash.*Reload/i);
+
+      const after = (yield* manager.list({ threadId: scope.thread.threadId })).sessions;
+      expect(after.map((session) => session.tabId)).toEqual(before.map((session) => session.tabId));
+      expect(after[0]?.navStatus).toMatchObject({
+        _tag: "LoadFailed",
+        description: expect.stringMatching(/crash/i),
+      });
+      expect((yield* Queue.clear(viewer.output)).some((item) => item._tag === "gone")).toBe(false);
+      expect(contexts[0]!.page.isClosed()).toBe(true);
+      for (const session of contexts[0]!.sessions) expect(session.detach).toHaveBeenCalledOnce();
+      contexts[0]!.page.emit("crash");
+      contexts[0]!.page.emit("close");
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live.each(["reload", "navigate", "agent"] as const)(
+  "a crashed tab recovers through %s with a new page and keeps its sibling",
+  (recovery) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const browser = yield* ServerBrowser.ServerBrowser;
+        const broker = yield* Broker.PreviewAutomationBroker;
+        const manager = yield* Manager.PreviewManager;
+        yield* Effect.yieldNow;
+        const events = yield* manager.subscribeEvents;
+        const opened = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: {
+            url: "https://example.com/original",
+            profileId: "default",
+            reuseExistingTab: false,
+            show: false,
+          },
+        });
+        const tabId = PreviewTabId.make(opened.tabId!);
+        let loaded = yield* PubSub.take(events);
+        while (
+          loaded.type !== "navigated" ||
+          loaded.tabId !== tabId ||
+          loaded.snapshot.navStatus._tag !== "Success"
+        )
+          loaded = yield* PubSub.take(events);
+        const viewport = { _tag: "freeform", width: 900, height: 600 } as const;
+        yield* manager.resize({ threadId: scope.thread.threadId, tabId, viewport });
+        yield* manager.adjust({
+          threadId: scope.thread.threadId,
+          tabId,
+          colorScheme: "dark",
+          zoomFactor: 1.25,
+        });
+        const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        const sibling = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { profileId: "default", reuseExistingTab: false, show: false },
+        });
+        const context = contexts[0]!;
+        expect(context.pages).toHaveLength(2);
+        const oldPage = context.pages[0]!;
+        const siblingPage = context.pages[1]!;
+        const before = (yield* manager.list({ threadId: scope.thread.threadId })).sessions.find(
+          (entry) => entry.tabId === tabId,
+        )!;
+        oldPage.emit("crash");
+        let failed = yield* PubSub.take(events);
+        while (failed.type !== "failed" || failed.tabId !== tabId)
+          failed = yield* PubSub.take(events);
+        const retained = (yield* manager.list({ threadId: scope.thread.threadId })).sessions.find(
+          (entry) => entry.tabId === tabId,
+        )!;
+        expect(retained).toMatchObject({
+          ...before,
+          navStatus: {
+            _tag: "LoadFailed",
+            url: "https://example.com/original",
+            title: "test page",
+          },
+          updatedAt: expect.any(String),
+          canGoBack: false,
+          canGoForward: false,
+        });
+        const failure = yield* broker
+          .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+          .pipe(Effect.flip);
+        expect(failure).toMatchObject({
+          _tag: "PreviewAutomationExecutionError",
+          message: expect.stringMatching(/crash.*Reload/i),
+        });
+        const siblingStatus = yield* broker.invoke<PreviewAutomationStatus>({
+          scope,
+          tabId: sibling.tabId!,
+          operation: "status",
+          input: {},
+        });
+        expect(siblingStatus.available).toBe(true);
+        expect(siblingStatus.tabs).toContainEqual(
+          expect.objectContaining({ tabId, url: "https://example.com/original" }),
+        );
+        const url =
+          recovery === "reload" ? "https://example.com/original" : "https://example.com/recovered";
+        if (recovery === "agent") {
+          const result = yield* broker.invoke<PreviewAutomationStatus>({
+            scope,
+            tabId,
+            operation: "navigate",
+            input: { url },
+          });
+          expect(result).toMatchObject({ tabId, url });
+        } else {
+          yield* viewer.input({ type: "takeControl" });
+          yield* viewer.input(
+            recovery === "reload" ? { type: "reload" } : { type: "navigate", url },
+          );
+        }
+        let recovered = yield* PubSub.take(events);
+        while (
+          recovered.type !== "navigated" ||
+          recovered.tabId !== tabId ||
+          recovered.snapshot.navStatus._tag !== "Success"
+        )
+          recovered = yield* PubSub.take(events);
+        expect(context.pages).toHaveLength(3);
+        const replacement = context.pages[2]!;
+        expect(replacement).not.toBe(oldPage);
+        expect(replacement.url()).toBe(url);
+        expect(oldPage.isClosed()).toBe(true);
+        expect(siblingPage.isClosed()).toBe(false);
+        expect(context.close).not.toHaveBeenCalled();
+        expect(replacement.viewportSize()).toEqual({ width: 900, height: 600 });
+        expect(replacement.emulateMedia).toHaveBeenCalledWith({ colorScheme: "dark" });
+        oldPage.emit("close");
+        oldPage.emit("crash");
+        oldPage.emit("load");
+        const sessions = (yield* manager.list({ threadId: scope.thread.threadId })).sessions;
+        expect(sessions.map((entry) => entry.tabId).sort()).toEqual([tabId, sibling.tabId].sort());
+        expect(sessions.find((entry) => entry.tabId === tabId)).toMatchObject({
+          profileId: "default",
+          viewport,
+          colorScheme: "dark",
+          zoomFactor: 1.25,
+          automationOwner: before.automationOwner,
+          navStatus: { _tag: "Success", url },
+        });
+        expect((yield* Queue.clear(viewer.output)).some((item) => item._tag === "reconnect")).toBe(
+          true,
+        );
+        const newViewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        expect((yield* Queue.clear(newViewer.output)).some((item) => item._tag === "frame")).toBe(
+          true,
+        );
+        yield* Effect.promise(() => replacement.close());
+        let closed = yield* PubSub.take(events);
+        while (closed.type !== "closed" || closed.tabId !== tabId)
+          closed = yield* PubSub.take(events);
+        expect(
+          (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map(
+            (entry) => entry.tabId,
+          ),
+        ).toEqual([sibling.tabId]);
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.live("a failed viewer reconnects without retrying and repeated crashes dispose recordings", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const events = yield* manager.subscribeEvents;
+      yield* broker.invoke<{ recording: boolean }>({
+        scope,
+        tabId,
+        operation: "recordingStart",
+        input: {},
+      });
+      const encoder = scratchContexts[0]!.page;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const context = contexts.at(-1)!;
+        context.pages.at(-1)!.emit("crash");
+        let failed = yield* PubSub.take(events);
+        while (failed.type !== "failed") failed = yield* PubSub.take(events);
+        const count = contexts.length;
+        const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        const readonly = yield* browser.attachViewer(viewerInput(tabId, false));
+        yield* readonly.input({ type: "reload" });
+        expect(contexts).toHaveLength(count);
+        expect(
+          (yield* Queue.clear(viewer.output)).some(
+            (item) => item._tag === "gone" || item._tag === "frame",
+          ),
+        ).toBe(false);
+        const foreign = yield* broker
+          .invoke<PreviewAutomationStatus>({
+            scope: asSession("agent-b"),
+            tabId,
+            operation: "navigate",
+            input: { url: "https://example.com/foreign" },
+          })
+          .pipe(Effect.flip);
+        expect(foreign).toMatchObject({
+          _tag: "PreviewAutomationControlInterruptedError",
+          reason: "agentMismatch",
+        });
+        yield* viewer.input({ type: "takeControl" });
+        yield* viewer.input({ type: "reload" });
+        expect(contexts).toHaveLength(count + 1);
+        let idle = yield* PubSub.take(events);
+        while (idle.type !== "navigated" || idle.snapshot.navStatus._tag !== "Idle")
+          idle = yield* PubSub.take(events);
+        yield* viewer.input({ type: "releaseControl" });
+        expect(
+          (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map(
+            (entry) => entry.tabId,
+          ),
+        ).toEqual([tabId]);
+      }
+      expect(encoder.isClosed()).toBe(true);
+      for (const context of contexts.slice(0, -1)) {
+        expect(context.page.isClosed()).toBe(true);
+        for (const session of context.sessions) expect(session.detach).toHaveBeenCalledOnce();
+      }
+      yield* broker.invoke<void>({ scope, tabId, operation: "close", input: {} });
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(0);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("a desktop-rendered server tab reconnects on explicit recovery after a crash", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      desktopRendersNext = true;
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const events = yield* manager.subscribeEvents;
+      const old = desktopConnections[0]!.context;
+      old.page.emit("crash");
+      yield* PubSub.take(events);
+      desktopDetaches.emit("detach", { threadId: scope.thread.threadId, tabId });
+      const failure = yield* broker
+        .invoke<PreviewAutomationStatus>({ scope, tabId, operation: "status", input: {} })
+        .pipe(Effect.flip);
+      expect(failure).toMatchObject({ _tag: "PreviewAutomationExecutionError" });
+      expect(desktopConnections).toHaveLength(1);
+      yield* viewer.input({ type: "takeControl" });
+      yield* viewer.input({ type: "navigate", url: "https://example.com/recovered" });
+      let loaded = yield* PubSub.take(events);
+      while (loaded.type !== "navigated" || loaded.snapshot.navStatus._tag !== "Success")
+        loaded = yield* PubSub.take(events);
+      expect(desktopConnections).toHaveLength(2);
+      expect(desktopConnections[1]!.context.page.goto).toHaveBeenCalledWith(
+        "https://example.com/recovered",
+        expect.any(Object),
+      );
+      for (const session of old.sessions) expect(session.detach).toHaveBeenCalledOnce();
+      expect(
+        (yield* manager.list({ threadId: scope.thread.threadId })).sessions.map(
+          (entry) => entry.tabId,
+        ),
+      ).toEqual([tabId]);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
+
+it.live("closing during crash recovery cannot resurrect the tab", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { browser, broker, tabId } = yield* ready;
+      const manager = yield* Manager.PreviewManager;
+      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+      const events = yield* manager.subscribeEvents;
+      contexts[0]!.page.emit("crash");
+      yield* PubSub.take(events);
+      yield* Queue.clear(viewer.output);
+      contextGate = Promise.withResolvers<void>();
+      contextEntered = Promise.withResolvers<void>();
+      const recovery = yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope,
+          tabId,
+          operation: "navigate",
+          input: { url: "https://example.com/recovered" },
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Effect.promise(() => contextEntered!.promise);
+      yield* manager.close({ threadId: scope.thread.threadId, tabId });
+      let gone = yield* Queue.take(viewer.output);
+      while (gone._tag !== "gone") gone = yield* Queue.take(viewer.output);
+      contextGate.resolve();
+      expect((yield* Fiber.join(recovery))._tag).toBe("Failure");
+      expect((yield* manager.list({ threadId: scope.thread.threadId })).sessions).toHaveLength(0);
+      expect(contexts.at(-1)!.page.isClosed()).toBe(true);
+    }),
+  ).pipe(Effect.provide(layer)),
+);
 
 it.live.each(["desktop" as const, undefined])(
   "explicit desktop targets ($0 runtime) fail without creating a server tab",
@@ -1463,28 +2126,36 @@ it.live("a file picker replaces a stalled viewer backlog instead of being droppe
   ).pipe(Effect.provide(layer)),
 );
 
-it.live("control updates replace a stalled viewer backlog in the order they happen", () =>
-  Effect.scoped(
-    Effect.gen(function* () {
-      const { browser, tabId } = yield* ready;
-      const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
-      yield* Queue.clear(viewer.output);
-      const acked = Promise.withResolvers<void>();
-      yield* Effect.addFinalizer(() => Effect.sync(() => acked.resolve()));
-      stallViewer(viewer, {
-        _tag: "frame",
-        data: Buffer.alloc(0),
-        ack: Effect.promise(() => acked.promise),
-      });
-      yield* viewer.input({ type: "takeControl" });
-      yield* viewer.input({ type: "releaseControl" });
-      const controls = (yield* Queue.clear(viewer.output)).flatMap((item) =>
-        item._tag === "control" ? [item.controller] : [],
-      );
-      expect(controls[0]).toBe("you");
-      expect(controls.at(-1)).not.toBe("you");
-    }),
-  ).pipe(Effect.provide(layer)),
+it.live.each([false, true])(
+  "control updates replace a stalled viewer backlog in order, crashed=%s",
+  (crashed) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { browser, tabId } = yield* ready;
+        if (crashed) {
+          const manager = yield* Manager.PreviewManager;
+          const events = yield* manager.subscribeEvents;
+          contexts[0]!.page.emit("crash");
+          yield* PubSub.take(events);
+        }
+        const viewer = yield* browser.attachViewer(viewerInput(tabId, true));
+        yield* Queue.clear(viewer.output);
+        const acked = Promise.withResolvers<void>();
+        yield* Effect.addFinalizer(() => Effect.sync(() => acked.resolve()));
+        stallViewer(viewer, {
+          _tag: "frame",
+          data: Buffer.alloc(0),
+          ack: Effect.promise(() => acked.promise),
+        });
+        yield* viewer.input({ type: "takeControl" });
+        yield* viewer.input({ type: "releaseControl" });
+        const controls = (yield* Queue.clear(viewer.output)).flatMap((item) =>
+          item._tag === "control" ? [item.controller] : [],
+        );
+        expect(controls[0]).toBe("you");
+        expect(controls.at(-1)).not.toBe("you");
+      }),
+    ).pipe(Effect.provide(layer)),
 );
 
 it.live("an agent's tabs stop at the limit until an unwatched idle tab closes", () =>

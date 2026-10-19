@@ -59,6 +59,7 @@ type NativeStreamBridge = {
   readonly onStreamingChange?: (streaming: boolean) => void;
   readonly compact?: boolean;
   readonly pdfUri?: string | null;
+  readonly pageFailure?: string;
 };
 
 async function sendFilesToPage(chooser: PreviewStreamFileChooser, pick: boolean) {
@@ -227,6 +228,7 @@ function PreviewStreamDocumentView({
   background,
   compact,
   pdfUri,
+  pageFailure,
   onUnauthorized,
   onGone,
   onViewport,
@@ -507,18 +509,24 @@ function PreviewStreamDocumentView({
           )}
         </View>
       ) : null}
-      {status !== "streaming" ? (
+      {pageFailure !== undefined || status !== "streaming" ? (
         <View
           className="absolute inset-0 items-center justify-center gap-4 px-6"
           style={{ backgroundColor: background }}
         >
-          {status === "connecting" ? <AppActivityIndicator colorClassName="accent-icon" /> : null}
+          {status === "connecting" && pageFailure === undefined ? (
+            <AppActivityIndicator colorClassName="accent-icon" />
+          ) : null}
           {compact ? null : (
             <AppText
               accessibilityLiveRegion="polite"
               className="text-center text-sm text-foreground-muted"
             >
-              {status === "error" ? error : "Connecting to browser..."}
+              {pageFailure !== undefined
+                ? pageFailure || "This browser page failed to load. Reload to try again."
+                : status === "error"
+                  ? error
+                  : "Connecting to browser..."}
             </AppText>
           )}
           {status === "error" && hostSetup && !compact ? (
